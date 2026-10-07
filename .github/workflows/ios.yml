@@ -1,0 +1,58 @@
+name: Build iOS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      upload:
+        description: "Tải lên App Store Connect (TestFlight)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  ios:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+      BUILD_NUMBER: ${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Chọn Xcode mới nhất
+        run: |
+          ls -d /Applications/Xcode*.app || true
+          X=$(ls -d /Applications/Xcode_*.app 2>/dev/null | grep -v -i beta | sort -V | tail -1)
+          if [ -n "$X" ]; then sudo xcode-select -s "$X"; fi
+          xcodebuild -version
+
+      - name: Tạo dự án Xcode
+        run: |
+          brew install xcodegen
+          python3 make_assets.py
+          xcodegen generate
+
+      - name: Build máy ảo + chụp ảnh màn hình App Store
+        run: bash screens.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: anh-app-store
+          path: shots/*.png
+
+      - name: Ký và tải lên App Store Connect
+        if: env.ASC_KEY_ID != '' && (github.event_name == 'push' || inputs.upload)
+        run: bash release.sh
+
+      - name: Đăng ảnh màn hình
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete "build-$BUILD_NUMBER" -y --cleanup-tag 2>/dev/null || true
+          gh release create "build-$BUILD_NUMBER" shots/*.png --title "Build $BUILD_NUMBER" --notes "Ảnh màn hình iPhone 6.9 inch tự chụp từ máy ảo."
