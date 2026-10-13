@@ -2,11 +2,15 @@ import UIKit
 import WebKit
 import SafariServices
 import Network
+import AuthenticationServices
 
 /// Màn hình chính: mở VietPickleball.vn trong WKWebView, kèm các tiện ích của app:
 /// kéo xuống để tải lại, thanh tiến trình, màn hình mất mạng (tự tải lại khi có mạng),
-/// mở link ngoài bằng trình duyệt trong app, chia sẻ / lưu tệp tải về, quét mã bằng camera.
-final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, WKScriptMessageHandler {
+/// mở link ngoài bằng trình duyệt trong app, chia sẻ / lưu tệp tải về, quét mã bằng camera,
+/// đăng nhập Google (qua cửa sổ đăng nhập an toàn của iOS) và Đăng nhập bằng Apple.
+final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, WKScriptMessageHandler,
+                                ASWebAuthenticationPresentationContextProviding, ASAuthorizationControllerDelegate,
+                                ASAuthorizationControllerPresentationContextProviding {
 
     static let home = URL(string: "https://vietpickleball.vn/")!
     static let ownHosts: Set<String> = ["vietpickleball.vn", "www.vietpickleball.vn"]
@@ -23,6 +27,7 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     private var downloadDestination: URL?
     private let pathMonitor = NWPathMonitor()
     private var isOnline = true
+    private var authSession: ASWebAuthenticationSession?
 
     override var preferredStatusBarStyle: UIStatusBarStyle { .lightContent }
 
@@ -39,6 +44,7 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         config.mediaTypesRequiringUserActionForPlayback = []
         config.websiteDataStore = .default()
         config.userContentController.add(self, name: "vpShare")
+        config.userContentController.add(self, name: "vpApple")
         config.userContentController.addUserScript(WKUserScript(source: Self.shareBridgeJS,
                                                                 injectionTime: .atDocumentStart,
                                                                 forMainFrameOnly: true))
@@ -196,6 +202,13 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
     /// Link từ ngoài vào app: vietpickleball://?g=ten-giai hoặc https://vietpickleball.vn/...
     func open(link: URL) {
+        // vé đăng nhập Google (dự phòng khi iOS chuyển vietpickleball://auth?t=… vào app thay vì cửa sổ đăng nhập)
+        if link.scheme?.lowercased() == "vietpickleball", link.host?.lowercased() == "auth",
+           let t = URLComponents(url: link, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "t" })?.value,
+           let next = URL(string: "https://vietpickleball.vn/?apptk=" + t) {
+            load(next)
+            return
+        }
         if let host = link.host?.lowercased(), Self.ownHosts.contains(host), link.scheme?.hasPrefix("http") == true {
             load(link)
             return
@@ -253,7 +266,11 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         case "about", "blob", "data", "javascript":
             decisionHandler(.allow)
         case "http", "https":
-            if isOwn(url) || navigationAction.targetFrame?.isMainFrame == false {
+            if isGoogleStart(url) {
+                // Google không cho đăng nhập trong khung web của app → mở cửa sổ đăng nhập an toàn của iOS
+                startGoogle(url)
+                decisionHandler(.cancel)
+            } else if isOwn(url) || navigationAction.targetFrame?.isMainFrame == false {
                 decisionHandler(.allow)
             } else {
                 openOutside(url)
@@ -426,6 +443,12 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     """
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        if message.name == "vpApple" {
+            guard Self.ownHosts.contains(message.frameInfo.securityOrigin.host.lowercased()) else { return }
+            let nonce = (message.body as? [String: Any])?["nonce"] as? String ?? ""
+            startApple(nonce: nonce)
+            return
+        }
         guard message.name == "vpShare", let body = message.body as? [String: Any] else { return }
         var items: [Any] = []
         if let files = body["files"] as? [[String: Any]] {
@@ -444,5 +467,90 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         if !text.isEmpty && items.isEmpty { items.append(text) }
         if let link = body["url"] as? String, let url = URL(string: link, relativeTo: webView.url)?.absoluteURL { items.append(url) }
         if !items.isEmpty { share(items: items) }
+    }
+
+    // MARK: - Đăng nhập Google (ASWebAuthenticationSession)
+
+    /// Trang bắt đầu đăng nhập Google của VietPickleball (?gstart=1…).
+    private func isGoogleStart(_ url: URL) -> Bool {
+        guard isOwn(url), let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems else { return false }
+        return items.contains { $0.name == "gstart" }
+    }
+
+    /// Mở ?gstart=1&app=1 trong cửa sổ đăng nhập của iOS. Xong, máy chủ chuyển về vietpickleball://auth?t=VÉ;
+    /// app mở https://vietpickleball.vn/?apptk=VÉ trong khung web để vào đúng phiên đăng nhập.
+    private func startGoogle(_ url: URL) {
+        guard authSession == nil, var comps = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return }
+        comps.scheme = "https"
+        comps.host = "vietpickleball.vn"
+        var items = (comps.queryItems ?? []).filter { $0.name != "app" }
+        items.append(URLQueryItem(name: "app", value: "1"))
+        comps.queryItems = items
+        guard let start = comps.url else { return }
+        let session = ASWebAuthenticationSession(url: start, callbackURLScheme: "vietpickleball") { [weak self] callback, _ in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.authSession = nil
+                // Bấm Hủy thì không có callback: giữ nguyên trang đăng nhập đang mở
+                guard let callback = callback,
+                      let t = URLComponents(url: callback, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "t" })?.value,
+                      let next = URL(string: "https://vietpickleball.vn/?apptk=" + t) else { return }
+                self.load(next)
+            }
+        }
+        session.presentationContextProvider = self
+        session.prefersEphemeralWebBrowserSession = false
+        authSession = session
+        if !session.start() { authSession = nil }
+    }
+
+    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+        return view.window ?? ASPresentationAnchor()
+    }
+
+    // MARK: - Đăng nhập bằng Apple (Sign in with Apple)
+
+    /// Trang web gọi window.webkit.messageHandlers.vpApple.postMessage({nonce}) — nonce do máy chủ cấp, dùng 1 lần.
+    private func startApple(nonce: String) {
+        let request = ASAuthorizationAppleIDProvider().createRequest()
+        request.requestedScopes = [.fullName, .email]
+        request.nonce = nonce
+        let controller = ASAuthorizationController(authorizationRequests: [request])
+        controller.delegate = self
+        controller.presentationContextProvider = self
+        controller.performRequests()
+    }
+
+    func presentationAnchor(for controller: ASAuthorizationController) -> ASPresentationAnchor {
+        return view.window ?? ASPresentationAnchor()
+    }
+
+    func authorizationController(controller: ASAuthorizationController, didCompleteWithAuthorization authorization: ASAuthorization) {
+        guard let credential = authorization.credential as? ASAuthorizationAppleIDCredential,
+              let tokenData = credential.identityToken,
+              let token = String(data: tokenData, encoding: .utf8) else {
+            sendAppleResult(["error": "token"])
+            return
+        }
+        // Apple chỉ gửi họ tên ở lần đăng nhập đầu tiên
+        let name = credential.fullName
+        sendAppleResult([
+            "token": token,
+            "given": name?.givenName ?? "",
+            "middle": name?.middleName ?? "",
+            "family": name?.familyName ?? ""
+        ])
+    }
+
+    func authorizationController(controller: ASAuthorizationController, didCompleteWithError error: Error) {
+        let canceled = (error as? ASAuthorizationError)?.code == .canceled
+        sendAppleResult(["error": canceled ? "cancel" : "fail"])
+    }
+
+    /// Trả kết quả cho trang web: window.vpAppleDone({...}).
+    private func sendAppleResult(_ body: [String: String]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: body),
+              let json = String(data: data, encoding: .utf8) else { return }
+        webView.evaluateJavaScript("window.vpAppleDone && window.vpAppleDone(\(json))", completionHandler: nil)
     }
 }
